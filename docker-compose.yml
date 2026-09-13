@@ -1,0 +1,109 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: taskflow-mongo
+    ports:
+      - "${MONGO_PORT:-27017}:27017"
+    volumes:
+      - taskflow-mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: taskflow-redis
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+    container_name: taskflow-api
+    command: ["node", "src/server.js"]
+    ports:
+      - "${API_PORT:-4000}:4000"
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      MONGO_URI: mongodb://mongo:27017/taskflow
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUEUE_NAME: taskflow-jobs
+      DEFAULT_MAX_ATTEMPTS: ${DEFAULT_MAX_ATTEMPTS:-3}
+      BACKOFF_DELAY_MS: ${BACKOFF_DELAY_MS:-1000}
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4000/api/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Two worker PROCESSES (containers), both consuming the same BullMQ
+  # queue via the shared Redis instance - this is what demonstrates
+  # "distributed" worker coordination in this project (see README).
+  worker-1:
+    build:
+      context: ./backend
+    container_name: taskflow-worker-1
+    command: ["node", "src/workers/worker.js"]
+    environment:
+      NODE_ENV: production
+      MONGO_URI: mongodb://mongo:27017/taskflow
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUEUE_NAME: taskflow-jobs
+      # Readable worker identity for logs/attempt history. Needed because
+      # process.pid is 1 inside every container - see worker.js comment.
+      WORKER_ID: worker-1
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-2:
+    build:
+      context: ./backend
+    container_name: taskflow-worker-2
+    command: ["node", "src/workers/worker.js"]
+    environment:
+      NODE_ENV: production
+      MONGO_URI: mongodb://mongo:27017/taskflow
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      QUEUE_NAME: taskflow-jobs
+      WORKER_ID: worker-2
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Built into the static JS bundle at image-build time. Must be a
+        # URL reachable from the HOST BROWSER, not the docker network -
+        # so it points at the api service's published host port.
+        VITE_API_URL: http://localhost:${API_PORT:-4000}
+    container_name: taskflow-frontend
+    ports:
+      - "${FRONTEND_PORT:-5173}:80"
+    depends_on:
+      - api
+
+volumes:
+  taskflow-mongo-data:
